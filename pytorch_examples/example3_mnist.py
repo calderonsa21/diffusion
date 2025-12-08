@@ -298,7 +298,7 @@ def save_image_grid(images, nrow=8, title="", path=""):
 def train(
     num_epochs=50,  # Increased for better convergence
     batch_size=128,
-    num_steps=200,  # Reduced from 1000 for easier learning
+    num_steps=1000,  # Reduced from 1000 for easier learning
     lr=1e-4,  # Slightly lower LR for stability
     sample_every=5,  # Sample every N epochs
     num_samples=64,  # Number of samples to generate
