@@ -8,8 +8,13 @@ What it shows:
 
 Configuration notes:
 - Uses 200 diffusion steps (reduced from 1000) for easier learning
-- Trains for 30 epochs to ensure recognizable digit generation
-- Model capacity increased (128 channels) for better expressiveness
+- Trains for 50 epochs with improved architecture for better convergence
+- Model improvements:
+  * Residual blocks with skip connections
+  * Group normalization for training stability
+  * Better time embedding integration
+  * Learning rate scheduling (cosine annealing)
+  * AdamW optimizer with weight decay
 
 Run:
   python pytorch_examples/example3_mnist.py
@@ -62,57 +67,92 @@ def make_beta_schedule(num_steps: int, kind: Literal["linear", "cosine"] = "line
 
 
 # -----------------------------
-# Model: Lightweight U-Net style denoiser
+# Model: Improved U-Net style denoiser with residual blocks
 # -----------------------------
-class UNetDenoiser(nn.Module):
-  """Lightweight convolutional denoiser for 28x28 images."""
+class ResidualBlock(nn.Module):
+  """Residual block with time conditioning."""
+  def __init__(self, in_channels, out_channels, t_dim):
+    super().__init__()
+    self.conv1 = nn.Conv2d(in_channels, out_channels, 3, padding=1)
+    self.norm1 = nn.GroupNorm(8, out_channels)
+    self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1)
+    self.norm2 = nn.GroupNorm(8, out_channels)
+    
+    # Time embedding projection
+    self.t_proj = nn.Linear(t_dim, out_channels)
+    
+    # Skip connection
+    if in_channels != out_channels:
+      self.skip = nn.Conv2d(in_channels, out_channels, 1)
+    else:
+      self.skip = nn.Identity()
 
-  def __init__(self, channels=128, t_dim=64):
+  def forward(self, x, t_emb):
+    h = self.conv1(x)
+    h = self.norm1(h)
+    h = F.relu(h)
+    
+    # Add time embedding
+    t_proj = self.t_proj(t_emb)[:, :, None, None]
+    h = h + t_proj
+    
+    h = self.conv2(h)
+    h = self.norm2(h)
+    h = F.relu(h)
+    
+    return h + self.skip(x)
+
+
+class UNetDenoiser(nn.Module):
+  """Improved convolutional denoiser for 28x28 images with residual blocks."""
+
+  def __init__(self, channels=128, t_dim=128):
     super().__init__()
     self.t_dim = t_dim
     
-    # Time embedding projection
-    self.t_proj = nn.Linear(t_dim, channels)
+    # Initial projection
+    self.conv_in = nn.Conv2d(1, channels // 2, 3, padding=1)
     
-    # Encoder
-    self.conv1 = nn.Conv2d(1, channels // 2, 3, padding=1)
-    self.conv2 = nn.Conv2d(channels // 2, channels, 3, stride=2, padding=1)  # 14x14
-    self.conv3 = nn.Conv2d(channels, channels, 3, padding=1)
+    # Encoder with residual blocks
+    self.enc1 = ResidualBlock(channels // 2, channels, t_dim)
+    self.down1 = nn.Conv2d(channels, channels, 3, stride=2, padding=1)  # 14x14
+    self.enc2 = ResidualBlock(channels, channels, t_dim)
     
     # Middle
-    self.mid_conv = nn.Conv2d(channels, channels, 3, padding=1)
+    self.mid = ResidualBlock(channels, channels, t_dim)
     
-    # Decoder
-    self.conv4 = nn.Conv2d(channels, channels, 3, padding=1)
-    self.conv5 = nn.Conv2d(channels, channels // 2, 3, padding=1)
-    self.upsample = nn.Upsample(scale_factor=2, mode='nearest')  # 14x14 -> 28x28
-    self.conv6 = nn.Conv2d(channels // 2, channels // 2, 3, padding=1)
-    self.out = nn.Conv2d(channels // 2, 1, 3, padding=1)
+    # Decoder with residual blocks
+    self.dec1 = ResidualBlock(channels, channels, t_dim)
+    self.up1 = nn.Upsample(scale_factor=2, mode='nearest')  # 28x28
+    self.dec2 = ResidualBlock(channels, channels // 2, t_dim)
+    
+    # Output
+    self.norm_out = nn.GroupNorm(8, channels // 2)
+    self.conv_out = nn.Conv2d(channels // 2, 1, 3, padding=1)
 
   def forward(self, x, t):
     # x: [B, 1, 28, 28]
     # t: [B]
     t_emb = sinusoidal_embedding(t, self.t_dim)
-    t_proj = self.t_proj(t_emb)  # [B, channels]
-    t_proj = t_proj[:, :, None, None]  # [B, channels, 1, 1]
     
     # Encoder
-    h = F.relu(self.conv1(x))  # [B, channels//2, 28, 28]
-    h = F.relu(self.conv2(h))  # [B, channels, 14, 14]
-    h = F.relu(self.conv3(h))  # [B, channels, 14, 14]
-    
-    # Add time embedding
-    h = h + t_proj
+    h = F.relu(self.conv_in(x))  # [B, channels//2, 28, 28]
+    h = self.enc1(h, t_emb)  # [B, channels, 28, 28]
+    h = self.down1(h)  # [B, channels, 14, 14]
+    h = self.enc2(h, t_emb)  # [B, channels, 14, 14]
     
     # Middle
-    h = F.relu(self.mid_conv(h))  # [B, channels, 14, 14]
+    h = self.mid(h, t_emb)  # [B, channels, 14, 14]
     
     # Decoder
-    h = F.relu(self.conv4(h))  # [B, channels, 14, 14]
-    h = F.relu(self.conv5(h))  # [B, channels//2, 14, 14]
-    h = self.upsample(h)  # [B, channels//2, 28, 28]
-    h = F.relu(self.conv6(h))  # [B, channels//2, 28, 28]
-    out = self.out(h)  # [B, 1, 28, 28]
+    h = self.dec1(h, t_emb)  # [B, channels, 14, 14]
+    h = self.up1(h)  # [B, channels, 28, 28]
+    h = self.dec2(h, t_emb)  # [B, channels//2, 28, 28]
+    
+    # Output
+    h = self.norm_out(h)
+    h = F.relu(h)
+    out = self.conv_out(h)  # [B, 1, 28, 28]
     
     return out
 
@@ -256,10 +296,10 @@ def save_image_grid(images, nrow=8, title="", path=""):
 # Training
 # -----------------------------
 def train(
-    num_epochs=30,
+    num_epochs=50,  # Increased for better convergence
     batch_size=128,
     num_steps=200,  # Reduced from 1000 for easier learning
-    lr=2e-4,
+    lr=1e-4,  # Slightly lower LR for stability
     sample_every=5,  # Sample every N epochs
     num_samples=64,  # Number of samples to generate
     schedule="linear",
@@ -271,7 +311,8 @@ def train(
   
   ddpm = DDPM(num_steps, schedule=schedule)
   model = UNetDenoiser().to(DEVICE)
-  opt = torch.optim.Adam(model.parameters(), lr=lr)
+  opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-6)
+  scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=num_epochs, eta_min=1e-6)
   
   losses = []
   step = 0
@@ -297,7 +338,8 @@ def train(
         print(f"Epoch {epoch}/{num_epochs}, batch {batch_idx}, loss={loss.item():.4f}")
     
     avg_loss = sum(epoch_losses) / len(epoch_losses)
-    print(f"Epoch {epoch} complete, avg loss={avg_loss:.4f}")
+    print(f"Epoch {epoch} complete, avg loss={avg_loss:.4f}, lr={scheduler.get_last_lr()[0]:.6f}")
+    scheduler.step()
     
     # Sample and save at checkpoints
     if epoch % sample_every == 0 or epoch == num_epochs:
