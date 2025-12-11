@@ -1,21 +1,23 @@
 """
-Example 2 – 2D Noisy Circle with DDPM (PyTorch, modern stack)
+Example 1 (part 2) – 1D Gaussian Mixture with DDPM (IMPROVED VERSION)
+
+Improved with:
+1. Enhanced model architecture (residual blocks, LayerNorm, SiLU activation)
+2. Better training configuration (more steps, cosine schedule, AdamW, LR scheduling)
 
 What it shows:
-- DDPM can learn manifold-like structure (points concentrated near a 1D curve in 2D).
-- Illustrates the "Euclidean noise + manifold data" assumption.
-- Time-lapsed visualization showing evolution of 2D distribution during reverse
-  diffusion process (from isotropic Gaussian noise to circle distribution).
+- DDPM can learn a multimodal 1D mixture (3 Gaussians at -4, 0, +4).
+- Outputs hist overlay (data vs model) and training loss curve.
+- Time-lapsed visualization showing evolution of probability distribution during
+  reverse diffusion process (from noise to final multimodal distribution).
 
 Outputs:
-- example2_scatter_data.png: Training data scatter plot
-- example2_scatter_model.png: Generated samples scatter plot
-- example2_loss_curve.png: Training loss over iterations
-- example2_timelapse_scatter.png: Grid showing 2D distribution evolution at
-  different timesteps during reverse diffusion
+- example1_improved_loss_curve.png: Training loss over iterations
+- example1_improved_hist_data_vs_model.png: Final histogram comparison
+- example1_improved_timelapse_histograms.png: Grid showing distribution evolution
 
 Run:
-  python pytorch_examples/circles1.py
+  python pytorch_examples/example1_1d_gaussian_part2_improved.py
 """
 
 import math
@@ -23,6 +25,7 @@ import os
 from typing import Literal
 
 import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -63,26 +66,40 @@ def make_beta_schedule(num_steps: int, kind: Literal["linear", "cosine"] = "line
 
 
 # -----------------------------
-# Model
+# Model: IMPROVED with residual blocks and normalization
 # -----------------------------
-class MLPDenoiser2D(nn.Module):
-  """Predicts 2D noise epsilon(x_t, t) for 2D input."""
+class MLPDenoiser(nn.Module):
+  """Improved denoiser with residual connections, LayerNorm, and SiLU activation."""
 
-  def __init__(self, hidden=256, t_dim=64):
+  def __init__(self, hidden=256, t_dim=128, num_layers=4):
     super().__init__()
     self.t_dim = t_dim
-    # Input: 2D x_t + time embedding
-    self.fc1 = nn.Linear(2 + t_dim, hidden)
-    self.fc2 = nn.Linear(hidden, hidden)
-    self.fc3 = nn.Linear(hidden, hidden)
-    self.out = nn.Linear(hidden, 2)  # Output 2D noise
+    
+    # Input projection
+    self.input_proj = nn.Linear(1 + t_dim, hidden)
+    
+    # Residual blocks
+    self.blocks = nn.ModuleList([
+      nn.Sequential(
+        nn.Linear(hidden, hidden),
+        nn.LayerNorm(hidden),
+        nn.SiLU(),  # Swish activation (x * sigmoid(x))
+        nn.Linear(hidden, hidden),
+        nn.LayerNorm(hidden)
+      ) for _ in range(num_layers)
+    ])
+    
+    self.out = nn.Linear(hidden, 1)
 
   def forward(self, x, t):
     t_emb = sinusoidal_embedding(t, self.t_dim)
     h = torch.cat([x, t_emb], dim=-1)
-    h = F.relu(self.fc1(h))
-    h = F.relu(self.fc2(h))
-    h = F.relu(self.fc3(h))
+    h = self.input_proj(h)
+    
+    # Apply residual blocks
+    for block in self.blocks:
+      h = h + block(h)  # Residual connection
+    
     return self.out(h)
 
 
@@ -130,7 +147,7 @@ class DDPM:
 
   @torch.no_grad()
   def sample_loop(self, model, batch_size):
-    xt = torch.randn(batch_size, 2, device=DEVICE)  # 2D noise
+    xt = torch.randn(batch_size, 1, device=DEVICE)
     for t in reversed(range(self.num_steps)):
       t_batch = torch.full((batch_size,), t, device=DEVICE, dtype=torch.long)
       xt = self.p_sample(model, xt, t_batch)
@@ -139,7 +156,7 @@ class DDPM:
   @torch.no_grad()
   def sample_loop_with_history(self, model, batch_size, save_every=50):
     """Sample and save intermediate states for visualization."""
-    xt = torch.randn(batch_size, 2, device=DEVICE)  # 2D noise
+    xt = torch.randn(batch_size, 1, device=DEVICE)
     history = [(self.num_steps - 1, xt.cpu().clone())]
     
     for t in reversed(range(self.num_steps)):
@@ -156,58 +173,76 @@ class DDPM:
 # -----------------------------
 # Data
 # -----------------------------
-def sample_circle_data(n: int, radius=1.0, noise_std=0.1) -> torch.Tensor:
+def sample_data(n: int, means=(-4.0, 0.0, 4.0), std=1.0) -> torch.Tensor:
+  means_t = torch.tensor(means, device=DEVICE)
+  choices = torch.randint(0, len(means), (n,), device=DEVICE)
+  base = means_t[choices]
+  noise = torch.randn(n, device=DEVICE) * std
+  x = base + noise
+  return x[:, None]  # [n, 1]
+
+
+def gaussian_pdf(x, mean, std):
+  """Compute Gaussian PDF manually."""
+  return (1.0 / (std * np.sqrt(2 * np.pi))) * np.exp(-0.5 * ((x - mean) / std) ** 2)
+
+
+def true_density(x, means=(-4.0, 0.0, 4.0), std=1.0):
   """
-  Generate points on a circle with small radial noise.
+  Compute the true probability density of the 3-mode Gaussian mixture.
   
   Args:
-    n: Number of samples
-    radius: Circle radius (default 1.0)
-    noise_std: Standard deviation of radial Gaussian noise
+    x: Array of x values
+    means: Tuple of means for each mode
+    std: Standard deviation (same for all modes)
   
   Returns:
-    Tensor of shape [n, 2] with 2D points
+    Array of density values
   """
-  # Sample angles uniformly from [0, 2π]
-  angles = torch.rand(n, device=DEVICE) * 2 * math.pi
-  
-  # Points on circle: (r cos θ, r sin θ)
-  x = radius * torch.cos(angles)
-  y = radius * torch.sin(angles)
-  
-  # Add small Gaussian noise
-  noise = torch.randn(n, 2, device=DEVICE) * noise_std
-  points = torch.stack([x, y], dim=1) + noise
-  
-  return points
+  x = np.asarray(x)
+  density = np.zeros_like(x, dtype=float)
+  for mean in means:
+    density += gaussian_pdf(x, mean, std)
+  density /= len(means)  # Normalize to make it a proper mixture
+  return density
 
 
 # -----------------------------
 # Training / plotting
 # -----------------------------
 def train(
-    steps=8000,
-    batch_size=256,
+    steps=15000,  # Increased from 8000
+    batch_size=512,  # Increased from 256
     num_steps=1000,
-    lr=1e-3,
+    lr=5e-4,  # Lower learning rate for stability
     log_every=500,
     sample_size=5000,
-    schedule="linear",
+    schedule="cosine",  # Changed from "linear" to "cosine"
     out_dir="pytorch_examples_outputs"):
   os.makedirs(out_dir, exist_ok=True)
 
-  # Prepare dataset (50k points as specified)
-  data = sample_circle_data(50_000)
+  # Prepare dataset once to match the spec (50k points)
+  data = sample_data(50_000)
   dataset = torch.utils.data.TensorDataset(data)
   loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True)
   data_iter = iter(loader)
 
   ddpm = DDPM(num_steps, schedule=schedule)
-  model = MLPDenoiser2D().to(DEVICE)
-  opt = torch.optim.Adam(model.parameters(), lr=lr)
+  model = MLPDenoiser(hidden=256, t_dim=128, num_layers=4).to(DEVICE)
+  
+  # IMPROVED: Use AdamW with weight decay and learning rate scheduling
+  opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
+  scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=steps, eta_min=1e-6)
+  
   losses = []
 
-  print("Training denoiser on 2D circle data...")
+  print(f"Training with improved configuration:")
+  print(f"  - Steps: {steps}")
+  print(f"  - Batch size: {batch_size}")
+  print(f"  - Learning rate: {lr}")
+  print(f"  - Schedule: {schedule}")
+  print(f"  - Model: {sum(p.numel() for p in model.parameters())} parameters")
+
   for step in range(1, steps + 1):
     try:
       (x0,) = next(data_iter)
@@ -220,87 +255,79 @@ def train(
     opt.zero_grad()
     loss.backward()
     opt.step()
+    scheduler.step()  # Update learning rate
+    
     losses.append(loss.item())
     if step % log_every == 0:
-      print(f"step {step:05d} loss={loss.item():.4f}")
+      current_lr = scheduler.get_last_lr()[0]
+      print(f"step {step:05d} loss={loss.item():.4f} lr={current_lr:.6f}")
 
-  print("Sampling from model with intermediate states...")
+  # Sample with history for time-lapsed visualization
+  print("Sampling with intermediate states...")
   with torch.no_grad():
     samples, history = ddpm.sample_loop_with_history(model, sample_size, save_every=num_steps // 10)
-    samples = samples.cpu().numpy()
+    samples = samples.cpu().numpy().reshape(-1)
 
-  # Generate fresh data for comparison
-  data_samples = sample_circle_data(sample_size).cpu().numpy()
-
-  # Plot 1: Training data scatter
-  plt.figure(figsize=(6, 6))
-  plt.scatter(data_samples[:, 0], data_samples[:, 1], s=4, alpha=0.5, label="training data")
-  plt.xlabel("x₁")
-  plt.ylabel("x₂")
-  plt.title("2D Noisy Circle: Training Data")
-  plt.axis("equal")
-  plt.legend()
-  plt.grid(True, alpha=0.3)
-  data_path = os.path.join(out_dir, "example2_scatter_data.png")
-  plt.tight_layout()
-  plt.savefig(data_path, dpi=200)
-  print(f"Saved training data plot to {data_path}")
-
-  # Plot 2: Generated samples scatter
-  plt.figure(figsize=(6, 6))
-  plt.scatter(samples[:, 0], samples[:, 1], s=4, alpha=0.5, label="generated samples", color="orange")
-  plt.xlabel("x₁")
-  plt.ylabel("x₂")
-  plt.title("2D Noisy Circle: Generated Samples")
-  plt.axis("equal")
-  plt.legend()
-  plt.grid(True, alpha=0.3)
-  model_path = os.path.join(out_dir, "example2_scatter_model.png")
-  plt.tight_layout()
-  plt.savefig(model_path, dpi=200)
-  print(f"Saved generated samples plot to {model_path}")
-
-  # Plot 3: Loss curve
-  plt.figure(figsize=(8, 5))
+  # Plots
+  plt.figure(figsize=(10, 4))
+  plt.subplot(1, 2, 1)
   plt.plot(losses)
-  plt.title("Training Loss")
-  plt.xlabel("iteration")
+  plt.title("Training loss (improved)")
+  plt.xlabel("step")
   plt.ylabel("loss")
-  plt.grid(True, alpha=0.3)
-  loss_path = os.path.join(out_dir, "example2_loss_curve.png")
+  loss_path = os.path.join(out_dir, "example1_improved_loss_curve.png")
   plt.tight_layout()
   plt.savefig(loss_path, dpi=200)
-  print(f"Saved loss curve to {loss_path}")
 
-  # Time-lapsed visualization: evolution of 2D distribution
-  print("Creating time-lapsed scatter plot visualization...")
+  plt.figure(figsize=(6, 4))
+  plt.hist(samples, bins=80, density=True, alpha=0.75, label="model")
+  plt.hist(sample_data(sample_size).cpu().numpy().reshape(-1),
+           bins=80, density=True, alpha=0.45, label="data")
+  plt.legend()
+  plt.title("1D Gaussian mixture: data vs model (improved)")
+  out_path = os.path.join(out_dir, "example1_improved_hist_data_vs_model.png")
+  plt.tight_layout()
+  plt.savefig(out_path, dpi=200)
+  print(f"Saved loss curve to {loss_path}")
+  print(f"Saved histogram to {out_path}")
+
+  # Time-lapsed visualization: evolution of probability distribution
+  print("Creating time-lapsed visualization...")
   n_steps = len(history)
   n_cols = min(5, n_steps)
   n_rows = (n_steps + n_cols - 1) // n_cols
   
-  fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 3, n_rows * 3))
+  fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 3, n_rows * 2.5))
   if n_rows == 1:
     axes = axes[None, :] if n_cols > 1 else axes
   elif n_cols == 1:
     axes = axes[:, None]
   
+  # Compute true distribution for overlay
+  x_true = np.linspace(-8, 8, 200)
+  y_true = true_density(x_true)
+  
   for idx, (t_step, xt_state) in enumerate(history):
     row, col = idx // n_cols, idx % n_cols
     ax = axes[row, col] if n_rows > 1 else axes[col]
     
-    points = xt_state.numpy()
-    ax.scatter(points[:, 0], points[:, 1], s=2, alpha=0.4, color='steelblue')
+    values = xt_state.numpy().reshape(-1)
+    # Histogram of generated samples
+    ax.hist(values, bins=60, density=True, alpha=0.6, color='steelblue', 
+            edgecolor='black', linewidth=0.5, label='generated')
+    # Overlay true distribution
+    ax.plot(x_true, y_true, color='red', linewidth=2, alpha=0.8, 
+            linestyle='--', label='true dist' if idx == 0 else '')
     ax.set_title(f't = {t_step}', fontsize=10)
-    ax.set_xlabel('x₁', fontsize=8)
-    ax.set_ylabel('x₂', fontsize=8)
-    ax.set_xlim(-4, 4)
-    ax.set_ylim(-4, 4)
-    ax.set_aspect('equal')
+    ax.set_xlabel('x', fontsize=8)
+    ax.set_ylabel('density', fontsize=8)
+    ax.set_xlim(-8, 8)
     ax.grid(True, alpha=0.3)
-    
-    # Draw reference circle
-    circle = plt.Circle((0, 0), 1.0, fill=False, color='red', linestyle='--', linewidth=1, alpha=0.5)
-    ax.add_patch(circle)
+    ax.axvline(-4, color='orange', linestyle=':', alpha=0.4, linewidth=1)
+    ax.axvline(0, color='orange', linestyle=':', alpha=0.4, linewidth=1)
+    ax.axvline(4, color='orange', linestyle=':', alpha=0.4, linewidth=1)
+    if idx == 0:
+      ax.legend(fontsize=7, loc='upper right')
   
   # Hide unused subplots
   for idx in range(n_steps, n_rows * n_cols):
@@ -308,9 +335,9 @@ def train(
     ax = axes[row, col] if n_rows > 1 else axes[col]
     ax.axis('off')
   
-  plt.suptitle('Reverse Diffusion Process: Evolution of 2D Distribution', fontsize=12, y=1.02)
+  plt.suptitle('Reverse Diffusion Process: Evolution of Probability Distribution (Improved)', fontsize=12, y=1.02)
   plt.tight_layout()
-  timeline_path = os.path.join(out_dir, "example2_timelapse_scatter.png")
+  timeline_path = os.path.join(out_dir, "example1_improved_timelapse_histograms.png")
   plt.savefig(timeline_path, dpi=200, bbox_inches='tight')
   print(f"Saved time-lapsed visualization to {timeline_path}")
 

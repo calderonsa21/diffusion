@@ -4,6 +4,14 @@ Example 1 (part 2) – 1D Gaussian Mixture with DDPM (PyTorch, modern stack)
 What it shows:
 - DDPM can learn a multimodal 1D mixture (3 Gaussians at -4, 0, +4).
 - Outputs hist overlay (data vs model) and training loss curve.
+- Time-lapsed visualization showing evolution of probability distribution during
+  reverse diffusion process (from noise to final multimodal distribution).
+
+Outputs:
+- example1_loss_curve.png: Training loss over iterations
+- example1_hist_data_vs_model.png: Final histogram comparison
+- example1_timelapse_histograms.png: Grid showing distribution evolution at
+  different timesteps during reverse diffusion
 
 Run:
   python pytorch_examples/example1_1d_gaussian_part2.py
@@ -14,6 +22,7 @@ import os
 from typing import Literal
 
 import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -126,6 +135,22 @@ class DDPM:
       xt = self.p_sample(model, xt, t_batch)
     return xt
 
+  @torch.no_grad()
+  def sample_loop_with_history(self, model, batch_size, save_every=50):
+    """Sample and save intermediate states for visualization."""
+    xt = torch.randn(batch_size, 1, device=DEVICE)
+    history = [(self.num_steps - 1, xt.cpu().clone())]
+    
+    for t in reversed(range(self.num_steps)):
+      t_batch = torch.full((batch_size,), t, device=DEVICE, dtype=torch.long)
+      xt = self.p_sample(model, xt, t_batch)
+      
+      # Save at regular intervals and at the end
+      if t % save_every == 0 or t == 0:
+        history.append((t, xt.cpu().clone()))
+    
+    return xt, history
+
 
 # -----------------------------
 # Data
@@ -137,6 +162,31 @@ def sample_data(n: int, means=(-4.0, 0.0, 4.0), std=1.0) -> torch.Tensor:
   noise = torch.randn(n, device=DEVICE) * std
   x = base + noise
   return x[:, None]  # [n, 1]
+
+
+def gaussian_pdf(x, mean, std):
+  """Compute Gaussian PDF manually."""
+  return (1.0 / (std * np.sqrt(2 * np.pi))) * np.exp(-0.5 * ((x - mean) / std) ** 2)
+
+
+def true_density(x, means=(-4.0, 0.0, 4.0), std=1.0):
+  """
+  Compute the true probability density of the 3-mode Gaussian mixture.
+  
+  Args:
+    x: Array of x values
+    means: Tuple of means for each mode
+    std: Standard deviation (same for all modes)
+  
+  Returns:
+    Array of density values
+  """
+  x = np.asarray(x)
+  density = np.zeros_like(x, dtype=float)
+  for mean in means:
+    density += gaussian_pdf(x, mean, std)
+  density /= len(means)  # Normalize to make it a proper mixture
+  return density
 
 
 # -----------------------------
@@ -180,8 +230,11 @@ def train(
     if step % log_every == 0:
       print(f"step {step:05d} loss={loss.item():.4f}")
 
+  # Sample with history for time-lapsed visualization
+  print("Sampling with intermediate states...")
   with torch.no_grad():
-    samples = ddpm.sample_loop(model, sample_size).cpu().numpy().reshape(-1)
+    samples, history = ddpm.sample_loop_with_history(model, sample_size, save_every=num_steps // 10)
+    samples = samples.cpu().numpy().reshape(-1)
 
   # Plots
   plt.figure(figsize=(10, 4))
@@ -205,6 +258,55 @@ def train(
   plt.savefig(out_path, dpi=200)
   print(f"Saved loss curve to {loss_path}")
   print(f"Saved histogram to {out_path}")
+
+  # Time-lapsed visualization: evolution of probability distribution
+  print("Creating time-lapsed visualization...")
+  n_steps = len(history)
+  n_cols = min(5, n_steps)
+  n_rows = (n_steps + n_cols - 1) // n_cols
+  
+  fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 3, n_rows * 2.5))
+  if n_rows == 1:
+    axes = axes[None, :] if n_cols > 1 else axes
+  elif n_cols == 1:
+    axes = axes[:, None]
+  
+  # Generate true distribution samples for histogram overlay
+  true_samples = sample_data(sample_size).cpu().numpy().reshape(-1)
+  
+  for idx, (t_step, xt_state) in enumerate(history):
+    row, col = idx // n_cols, idx % n_cols
+    ax = axes[row, col] if n_rows > 1 else axes[col]
+    
+    values = xt_state.numpy().reshape(-1)
+    # Histogram of true distribution (background)
+    ax.hist(true_samples, bins=60, density=True, alpha=0.4, color='red', 
+            edgecolor='darkred', linewidth=0.5, label='true dist' if idx == 0 else '')
+    # Histogram of generated samples (foreground)
+    ax.hist(values, bins=60, density=True, alpha=0.7, color='steelblue', 
+            edgecolor='black', linewidth=0.5, label='generated' if idx == 0 else '')
+    ax.set_title(f't = {t_step}', fontsize=10)
+    ax.set_xlabel('x', fontsize=8)
+    ax.set_ylabel('density', fontsize=8)
+    ax.set_xlim(-8, 8)
+    ax.grid(True, alpha=0.3)
+    ax.axvline(-4, color='orange', linestyle=':', alpha=0.4, linewidth=1)
+    ax.axvline(0, color='orange', linestyle=':', alpha=0.4, linewidth=1)
+    ax.axvline(4, color='orange', linestyle=':', alpha=0.4, linewidth=1)
+    if idx == 0:
+      ax.legend(fontsize=7, loc='upper right')
+  
+  # Hide unused subplots
+  for idx in range(n_steps, n_rows * n_cols):
+    row, col = idx // n_cols, idx % n_cols
+    ax = axes[row, col] if n_rows > 1 else axes[col]
+    ax.axis('off')
+  
+  plt.suptitle('Reverse Diffusion Process: Evolution of Probability Distribution', fontsize=12, y=1.02)
+  plt.tight_layout()
+  timeline_path = os.path.join(out_dir, "example1_timelapse_histograms.png")
+  plt.savefig(timeline_path, dpi=200, bbox_inches='tight')
+  print(f"Saved time-lapsed visualization to {timeline_path}")
 
 
 if __name__ == "__main__":
