@@ -91,6 +91,20 @@ class DDPM:
       xt = self.p_sample(model, xt, t_batch)
     return xt
 
+  @torch.no_grad()
+  def sample_loop_with_history(self, model, batch_size, save_every=50):
+    """
+    Sample with intermediate saves for visualization (reverse diffusion trajectory).
+    """
+    xt = torch.randn(batch_size, 2, device=DEVICE)
+    history = [(self.num_steps - 1, xt.cpu().clone())]
+    for t in reversed(range(self.num_steps)):
+      t_batch = torch.full((batch_size,), t, device=DEVICE, dtype=torch.long)
+      xt = self.p_sample(model, xt, t_batch)
+      if t % save_every == 0 or t == 0:
+        history.append((t, xt.cpu().clone()))
+    return xt, history
+
 
 def sample_data(batch_size: int, radius=3.0, noise_std=0.1):
   angles = torch.rand(batch_size, device=DEVICE) * 2 * math.pi
@@ -104,7 +118,7 @@ def sample_data(batch_size: int, radius=3.0, noise_std=0.1):
 def train(
     steps=3000,
     batch_size=256,
-    num_steps=200,
+    num_steps=1000,
     lr=1e-3,
     log_every=300,
     sample_size=1000,
@@ -126,7 +140,8 @@ def train(
       print(f"step {step:04d} loss={loss.item():.4f}")
 
   with torch.no_grad():
-    samples = ddpm.sample_loop(model, sample_size).cpu().numpy()
+    samples, history = ddpm.sample_loop_with_history(model, sample_size, save_every=max(1, num_steps // 10))
+    samples = samples.cpu().numpy()
     data = sample_data(sample_size).cpu().numpy()
 
   plt.figure(figsize=(10, 4))
@@ -147,6 +162,57 @@ def train(
   plt.tight_layout()
   plt.savefig(out_path, dpi=200)
   print(f"Saved plot to {out_path}")
+
+  # Time-lapse scatter of reverse diffusion
+  print("Creating time-lapse scatter...")
+  n_steps = len(history)
+  n_cols = min(5, n_steps)
+  n_rows = (n_steps + n_cols - 1) // n_cols
+  fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 3, n_rows * 3))
+  if n_rows == 1:
+    axes = axes[None, :] if n_cols > 1 else axes
+  elif n_cols == 1:
+    axes = axes[:, None]
+
+  # Generate true distribution samples for overlay
+  true_samples = sample_data(sample_size).cpu().numpy()
+
+  for idx, (t_step, xt_state) in enumerate(history):
+    row, col = idx // n_cols, idx % n_cols
+    ax = axes[row, col] if n_rows > 1 else axes[col]
+    pts = xt_state.numpy()
+    
+    # Overlay true distribution scatter (background)
+    ax.scatter(true_samples[:, 0], true_samples[:, 1], s=2, alpha=0.3, 
+              color="red", label="true dist" if idx == 0 else "")
+    # Generated samples scatter (foreground)
+    ax.scatter(pts[:, 0], pts[:, 1], s=2, alpha=0.6, color="steelblue", 
+              label="generated" if idx == 0 else "")
+    
+    ax.set_title(f"t = {t_step}", fontsize=10)
+    ax.set_xlabel("x₁", fontsize=8)
+    ax.set_ylabel("x₂", fontsize=8)
+    ax.set_xlim(-4, 4)
+    ax.set_ylim(-4, 4)
+    ax.set_aspect("equal")
+    ax.grid(True, alpha=0.3)
+    # reference circle
+    circle = plt.Circle((0, 0), 3.0, fill=False, color="orange", linestyle=":", linewidth=1, alpha=0.5)
+    ax.add_patch(circle)
+    if idx == 0:
+      ax.legend(fontsize=7, loc="upper right")
+
+  # Hide unused subplots
+  for idx in range(n_steps, n_rows * n_cols):
+    row, col = idx // n_cols, idx % n_cols
+    ax = axes[row, col] if n_rows > 1 else axes[col]
+    ax.axis("off")
+
+  plt.suptitle("Reverse Diffusion Process: 2D Circle Evolution", fontsize=12, y=1.02)
+  plt.tight_layout()
+  timeline_path = os.path.join(out_dir, "example2_timelapse_scatter.png")
+  plt.savefig(timeline_path, dpi=200, bbox_inches="tight")
+  print(f"Saved time-lapse scatter to {timeline_path}")
 
 
 if __name__ == "__main__":
